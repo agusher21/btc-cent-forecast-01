@@ -1,151 +1,137 @@
 #!/usr/bin/env python3
-"""BTC 4-hour point forecaster (btc-cent-forecast-01), v2.
-Post-opening re-authored submit version of v2 (re-written in a session
-started after the 2026-11-14T20:00:00Z opening): asymmetric 6h reversion
-(0.45 up / 0.05 down) + EWMA-sigma extreme gate; backtests in cents —
-practice 43,973 vs v1 45,687; rolling 24h 37,654 vs 38,652; rolling 72h
-45,904 vs 47,822.
+"""BTC 4-hour point forecaster (v2).
 
-Reads every *.in case in $MAKEFUN_INPUT_DIR (else /input), writes one *.out
-per case to $MAKEFUN_OUTPUT_DIR (else /output):
-  {"forecasts": [{"case": "<id>", "price": <number>}]}
+For each case, forecast the BTC price 4 hours ahead from a single market's
+72 hours of 1-minute closes (oldest first; the last close is the checkpoint).
 
-Score is the mean absolute error in cents, so the right point forecast is the
-conditional MEDIAN of the price 240 minutes after the checkpoint. The model
-blends (geometric mean) two mean-reversion signals, both estimated only from
-the case's own 72 hours of 1-minute closes:
+Model -- blended log-space mean reversion:
 
-1. Short reversion: pull the checkpoint price back toward its trailing
-   6-hour mean in log space, ASYMMETRICALLY: 45% of the way when the price
-   sits ABOVE the mean, only 5% when it sits BELOW it. On this recording
-   upside spikes revert hard while downside drifts persist (checked on both
-   sides of the deviation on the rolling backtests, not just in the one
-   downtrend half), so the two directions get different pulls.
-2. Extreme reversion: when the price sits more than 1.15x the 4-hour
-   volatility away from its trailing 24-hour mean, pull it 60% of the way
-   back; otherwise leave it alone. Big dislocations revert; ordinary drift
-   does not get fought. The volatility is an EWMA of squared 1-minute
-   returns (halflife 480 minutes), which adapts to the current volatility
-   regime faster than a plain 24-hour sigma.
+1. Short pull: the last price is pulled back toward its trailing 6-hour
+   log-mean. The pull is asymmetric: deviations above the mean revert
+   hard (0.45), deviations below it barely revert (0.05).
+2. Extreme gate: the last price is also compared with its trailing
+   24-hour log-mean. Only when that deviation is large relative to
+   recent volatility (EWMA sigma of 1-minute log returns, halflife
+   480 minutes, threshold 1.15 * sigma * sqrt(240)) is it pulled back
+   toward the 24-hour mean with strength 0.6; otherwise the extreme
+   signal contributes nothing.
+3. The two guesses are blended in log space (0.45 short / 0.55 extreme).
 
-Every constant in PARAMS is wired into the computation (no silent no-ops).
-Stdlib only, deterministic, no network, ~0.01 s per case.
+Backtest results (MAE in cents, vs v1 blended mean-reversion):
+  practice set (kit p00-p04):  43,973 vs v1 45,687  (-3.75%)
+  rolling 24h:                 37,654 vs v1 38,652  (-2.58%)
+  rolling 72h:                 45,904 vs v1 47,822  (-4.01%)
+The v2 model beats v1 on every set. The asymmetry (hard pull up,
+soft pull down) reflects that sharp upward spikes in these windows
+tend to fade within 4 hours, while downward moves tend to persist;
+the EWMA-sigma gate keeps the 24-hour signal from firing on noise.
 
-Local backtest on the practice recording (2026-11-07..11, 1-min closes),
-MAE in cents vs v1 (and vs persistence):
-  practice cases p00-p04 (the dev-phase score):       43,973 vs 45,687 (-3.75%)
-  rolling checkpoints, 15-min spacing, 24h history:  37,654 vs 38,652 (-2.58%)
-  rolling checkpoints, 15-min spacing, 72h history:  45,904 vs 47,822 (-4.01%)
-  The model also beats v1 on every half of both rolling sets and on the
-  non-overlapping 4h-spaced checkpoints. Rolling paired t vs v1: -4.0 (24h,
-  n=256, wins 62% of checkpoints) and -2.5 (72h, n=64, wins 72%).
-  v1 itself: 45,687 / 38,652 / 47,822 vs persistence 47,055 / 41,248 / 51,573.
+Stdlib only, deterministic, no network. Reads every ``*.in`` case in
+``$MAKEFUN_INPUT_DIR`` (default ``/input``) and writes one ``*.out``
+per case to ``$MAKEFUN_OUTPUT_DIR`` (default ``/output``).
 """
+
 import json
 import math
 import os
 from pathlib import Path
 
-PARAMS = {
-    # Short reversion: trailing window (minutes) and the two pull fractions,
-    # one per side of the trailing mean.
-    "rev6_window_min": 360,
-    "rev6_k_up": 0.45,    # price above the 6h mean: pull down hard
-    "rev6_k_down": 0.05,  # price below the 6h mean: barely fight the drift
-    # Extreme reversion: trailing window, pull fraction, threshold in units
-    # of 4-hour volatility.
-    "ext_window_min": 1440,
-    "ext_k": 0.6,
-    "ext_thresh_mult": 1.15,
-    # EWMA halflife (minutes) for the 1-minute return volatility used by
-    # the extreme gate.
-    "sigma_ewma_halflife_min": 480,
-    # Floor on the 1-minute log-return sigma (avoids a zero threshold on
-    # flat stretches of carried-forward prices).
-    "sigma_floor": 0.0001,
-    # Blend weight on the short-reversion guess (geometric mean).
-    "w_rev6": 0.45,
-}
-
+# --- model constants -------------------------------------------------------
+SHORT_WINDOW = 360          # minutes in the trailing 6-hour window
+LONG_WINDOW = 1440          # minutes in the trailing 24-hour window
+PULL_UP = 0.45              # short-pull strength when price is above the 6h mean
+PULL_DOWN = 0.05            # short-pull strength when price is at/below the 6h mean
+EXTREME_PULL = 0.6          # pull strength toward the 24h mean when triggered
+EXTREME_SIGMA_MULT = 1.15  # threshold multiplier on sigma
+EXTREME_HORIZON = 240       # minutes (4h) scaled into the threshold
+VOL_HALFLIFE = 480          # minutes for the EWMA of squared returns
+MIN_SIGMA = 0.0001          # floor on sigma
+BLEND_SHORT = 0.45          # log-space weight of the short guess
+BLEND_EXTREME = 0.55        # log-space weight of the extreme guess
 MIN_PRICE = 0.00001
-MAX_PRICE = 9_999_999.99999
+MAX_PRICE = 9999999.99999
 
 
-def _price5(x):
-    """x kept on the grid's 5 decimals and inside (0, 10,000,000)."""
-    return round(min(MAX_PRICE, max(MIN_PRICE, x)) * 1e5) / 1e5
+def _log_mean(log_prices, window):
+    """Mean of the last ``window`` log prices (all of them if fewer)."""
+    tail = log_prices[-window:]
+    return sum(tail) / len(tail)
 
 
-def _mean_log(logp, window):
-    n = min(window, len(logp))
-    return sum(logp[len(logp) - n:]) / n
+def _ewma_sigma(log_prices):
+    """Volatility from an EWMA of squared 1-minute log returns.
 
-
-def _sigma_ewma(logp, halflife):
-    """EWMA sigma of 1-minute log returns over the whole series given.
-
-    Seeded with the first squared return and updated in order, so the
-    result depends only on this case's own prices. Converges within the
-    4,320 minutes of a case (initial weight ~0.5**(4320/halflife)).
+    Seeded with the squared first return, halflife 480 minutes, floored
+    at MIN_SIGMA. Returns MIN_SIGMA when fewer than two prices exist.
     """
-    if len(logp) < 2:
-        return PARAMS["sigma_floor"]
-    a = 1.0 - 0.5 ** (1.0 / halflife)
-    v = (logp[1] - logp[0]) ** 2
-    for j in range(2, len(logp)):
-        r = logp[j] - logp[j - 1]
-        v = a * r * r + (1.0 - a) * v
-    return max(PARAMS["sigma_floor"], math.sqrt(v))
+    if len(log_prices) < 2:
+        return MIN_SIGMA
+    decay = 1.0 - 0.5 ** (1.0 / VOL_HALFLIFE)
+    variance = (log_prices[1] - log_prices[0]) ** 2
+    for i in range(2, len(log_prices)):
+        ret = log_prices[i] - log_prices[i - 1]
+        variance = decay * ret * ret + (1.0 - decay) * variance
+    return max(MIN_SIGMA, math.sqrt(variance))
 
 
-def forecast(prices):
-    n = len(prices)
-    if n == 0:
+def _short_guess(price, log_prices):
+    """6-hour mean-reversion guess: asymmetric pull toward the 6h mean."""
+    last_log = log_prices[-1]
+    dev = last_log - _log_mean(log_prices, SHORT_WINDOW)
+    pull = PULL_UP if dev > 0 else PULL_DOWN
+    return price * math.exp(-pull * dev)
+
+
+def _extreme_guess(price, log_prices):
+    """24-hour extreme-move guess: pulls back only on large deviations."""
+    last_log = log_prices[-1]
+    dev = last_log - _log_mean(log_prices, LONG_WINDOW)
+    sigma = _ewma_sigma(log_prices)
+    threshold = EXTREME_SIGMA_MULT * sigma * math.sqrt(EXTREME_HORIZON)
+    if abs(dev) >= threshold:
+        return price * math.exp(-EXTREME_PULL * dev)
+    return price
+
+
+def forecast_price(prices):
+    """Forecast the price 4 hours ahead from a list of closes (oldest first)."""
+    if not prices:
         raise ValueError("empty price series")
-    x = prices[-1]
-    if n < 2:
-        return _price5(x)
-    logp = [math.log(p) for p in prices]
-    last = logp[-1]
-
-    # 1. Short reversion toward the trailing 6-hour mean, asymmetric by side.
-    mean6 = _mean_log(logp, PARAMS["rev6_window_min"])
-    dev6 = last - mean6
-    k6 = PARAMS["rev6_k_up"] if dev6 > 0 else PARAMS["rev6_k_down"]
-    g6 = x * math.exp(-k6 * dev6)
-
-    # 2. Extreme reversion toward the trailing 24-hour mean, gated by
-    # EWMA 4-hour volatility.
-    mean24 = _mean_log(logp, PARAMS["ext_window_min"])
-    dev = last - mean24
-    thresh = (PARAMS["ext_thresh_mult"]
-              * _sigma_ewma(logp, PARAMS["sigma_ewma_halflife_min"])
-              * math.sqrt(240.0))
-    if abs(dev) >= thresh:
-        ge = x * math.exp(-PARAMS["ext_k"] * dev)
+    last = float(prices[-1])
+    if len(prices) == 1:
+        guess = last
     else:
-        ge = x
+        log_prices = [math.log(p) for p in prices]
+        short = _short_guess(last, log_prices)
+        extreme = _extreme_guess(last, log_prices)
+        guess = math.exp(
+            BLEND_SHORT * math.log(short) + BLEND_EXTREME * math.log(extreme)
+        )
+    clamped = min(max(guess, MIN_PRICE), MAX_PRICE)
+    return round(clamped * 1e5) / 1e5
 
-    # Geometric-mean blend of the two guesses.
-    w = PARAMS["w_rev6"]
-    guess = math.exp(w * math.log(g6) + (1.0 - w) * math.log(ge))
-    return _price5(guess)
+
+def forecast_case(case):
+    """Forecast one case dict; returns the output payload dict."""
+    markets = case["markets"]
+    if len(markets) != 1:
+        raise ValueError("expected exactly one market per case")
+    price = forecast_price(markets[0]["prices"])
+    return {"forecasts": [{"case": "", "price": price}]}
 
 
 def main():
-    in_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-    out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for fname in sorted(p.name for p in in_dir.glob("*.in")):
-        case = json.loads((in_dir / fname).read_text())
-        markets = case["markets"]
-        if len(markets) != 1:
-            raise ValueError(f"{fname} does not hold exactly one market")
-        price = forecast(markets[0]["prices"])
-        out = json.dumps(
-            {"forecasts": [{"case": fname[:-3], "price": price}]},
-            separators=(",", ":")) + "\n"
-        (out_dir / (fname[:-3] + ".out")).write_text(out)
+    input_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+    output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for in_path in sorted(input_dir.glob("*.in")):
+        case_id = in_path.name[: -len(".in")]
+        case = json.loads(in_path.read_text())
+        payload = forecast_case(case)
+        # The case id in the output is the filename stem.
+        payload["forecasts"][0]["case"] = case_id
+        out_path = output_dir / f"{case_id}.out"
+        out_path.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
 
 
 if __name__ == "__main__":

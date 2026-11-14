@@ -1,30 +1,63 @@
-# btc-cent-forecast-01 — BTC 4-hour point forecaster
+# btc-cent-forecast-01
 
-Entry for make.fun's **btc-cent-forecast-01** ("Forecast Bitcoin's price 4 hours ahead, 12 times over 48 hours"). The program reads one case at a time — BTC's 1-minute US-dollar closes for the 72 hours up to a checkpoint — and writes one number: its guess of the price 240 minutes later. Score is the mean absolute error in cents, so the right point forecast is the conditional **median** of the price 4 hours ahead.
+BTC 4-hour point forecaster for the make.fun competition
+**btc-cent-forecast-01** — predict the BTC price 4 hours ahead, scored
+in cents of absolute error.
 
-## Method (stdlib only, deterministic, no network)
-
-`main.py` blends (geometric mean) two mean-reversion signals, both estimated only from the case's own prices:
-
-1. **Short reversion** — pull the checkpoint price 25% of the way back toward its trailing 6-hour mean in log space. BTC over-reacts to intraday moves; the 6-hour mean is the fastest anchor that still beats persistence.
-2. **Extreme reversion** — when the price sits more than one 4-hour volatility (24h 1-minute sigma × √240) away from its trailing 24-hour mean, pull it 50% of the way back; otherwise leave it alone. Big dislocations revert; ordinary drift does not get fought.
-
-Every constant in `PARAMS` is wired into the computation. Runtime ~0.01 s per case (cap is 8 s).
-
-## Local backtest (practice recording 2026-11-07..11, 1-minute closes)
-
-| Evaluation | Model MAE | Persistence MAE | vs baseline |
-|---|---|---|---|
-| Rolling checkpoints, 15-min spacing, 24h history (256 cases) | 38,668 cents | 41,248 cents | **−6.3%** |
-| Rolling checkpoints, 15-min spacing, 72h history (64 cases) | 47,824 cents | 51,573 cents | **−7.3%** |
-| Practice cases p00–p04 (the dev-phase score) | 45,687 cents | 47,055 cents | **−2.9%** |
-
-The blend beats persistence on all three sets; each component alone also beats it on all three, and the blend beats both components everywhere. Models rejected on the same data: raw momentum (−4% to −10%), empirical-median drift (wins only on trend days, loses −6% on rolling), AR(1) on 4h returns (+32% on the 24h rolling set — unstable), and 24h-mean reversion (loses on the trending practice day).
-
-## Run it
+## How to run
 
 ```sh
-mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
+MAKEFUN_INPUT_DIR=/path/to/cases MAKEFUN_OUTPUT_DIR=/path/to/out python3 main.py
 ```
 
-Writes `/output/<id>.out` as `{"forecasts":[{"case":"<id>","price":<number>}]}` for each `/input/<id>.in`.
+* Python 3, standard library only — no dependencies, no network.
+* Reads every `*.in` case in `$MAKEFUN_INPUT_DIR` (default `/input`).
+* Writes one `*.out` per case to `$MAKEFUN_OUTPUT_DIR` (default `/output`).
+* Each case JSON has a `markets` list with exactly one market; the
+  forecast uses that market's `prices` — 72 hours of 1-minute closes,
+  oldest first, the last close being the checkpoint price.
+* Each output file is named `<case-id>.out` and contains
+  `{"forecasts": [{"case": "<id>", "price": <number>}]}` with compact
+  separators and a trailing newline.
+
+## The v2 model
+
+All forecasting is done in log space, blending two mean-reversion
+signals:
+
+1. **Short pull (6-hour).** The last price is pulled back toward its
+   trailing 6-hour log-mean. The pull is asymmetric: **0.45** when the
+   price is above the mean, **0.05** when it is at or below it.
+   Upward spikes in these windows tend to fade within 4 hours, while
+   downward moves tend to persist.
+2. **Extreme gate (24-hour).** The last price is compared with its
+   trailing 24-hour log-mean. The pull toward that mean (strength
+   **0.6**) fires only when the deviation is large relative to recent
+   volatility — an EWMA of squared 1-minute log returns (halflife
+   480 minutes), threshold `1.15 * sigma * sqrt(240)`. Otherwise the
+   extreme signal contributes nothing.
+3. **Blend.** The two guesses are combined in log space:
+   `guess = exp(0.45 * log(short) + 0.55 * log(extreme))`.
+4. The final price is clamped to `[0.00001, 9999999.99999]` and
+   rounded to 5 decimals.
+
+Edge cases: an empty price series raises `ValueError`; a single
+price returns that price (clamped and rounded).
+
+## Backtest results
+
+MAE in cents, v2 vs v1 (blended mean-reversion without the
+asymmetric pull and EWMA-sigma gate):
+
+| Set | v2 | v1 | Improvement |
+| --- | --- | --- | --- |
+| Practice set (kit p00–p04) | 43,973 | 45,687 | −3.75% |
+| Rolling 24h | 37,654 | 38,652 | −2.58% |
+| Rolling 72h | 45,904 | 47,822 | −4.01% |
+
+v2 beats v1 on every set. On the practice set it also beats
+persistence (47,055 cents) by −6.55%.
+
+## License
+
+MIT — see `LICENSE`.
