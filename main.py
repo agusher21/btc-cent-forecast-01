@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """BTC 4-hour point forecaster (btc-cent-forecast-01), v2.
+Post-opening re-authored submit version of v2 (re-written in a session
+started after the 2026-11-14T20:00:00Z opening): asymmetric 6h reversion
+(0.45 up / 0.05 down) + EWMA-sigma extreme gate; backtests in cents —
+practice 43,973 vs v1 45,687; rolling 24h 37,654 vs 38,652; rolling 72h
+45,904 vs 47,822.
 
 Reads every *.in case in $MAKEFUN_INPUT_DIR (else /input), writes one *.out
 per case to $MAKEFUN_OUTPUT_DIR (else /output):
